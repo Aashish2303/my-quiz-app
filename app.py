@@ -49,7 +49,7 @@ def get_progress(user, topic):
     conn.close()
     return data if data else (0, 0)
 
-# --- 2. MESSY PDF PARSER ---
+# --- 2. ROBUST PDF PARSER (Fixes your "Messy" PDF) ---
 @st.cache_data
 def load_data_messy():
     # Find PDF
@@ -75,28 +75,22 @@ def load_data_messy():
         line = line.strip()
         if not line: continue
         
-        # --- CLEAN THE LINE (The Fix) ---
-        # Remove quotes and leading commas usually found in this specific PDF
+        # --- CLEAN THE LINE ---
+        # Your PDF has quotes like "1." and commas at the start. We remove them.
         clean_line = line.replace('"', '').replace("'", "")
         if clean_line.startswith(','): clean_line = clean_line[1:].strip()
         
         # 1. Detect Question Start (e.g. 1. or 105.)
-        # We look for a number followed by a dot at the VERY START
         if re.match(r'^\d+\.', clean_line):
-            # Save previous question
             if current_q: questions[current_topic].append(current_q)
+            current_q = {"q": clean_line, "options": [], "ans": None}
             
-            current_q = {
-                "q": clean_line, 
-                "options": [], 
-                "ans": None
-            }
             # Check if answer key is on the same line like "1. Question... (B)"
             ans_match = re.search(r'\(\s*([A-D])\s*\)', clean_line)
             if ans_match:
                 current_q['ans'] = ans_match.group(1)
         
-        # 2. Detect Answer Key (B) or ( B ) on its own line
+        # 2. Detect Answer Key (B) or ( B )
         elif current_q and re.search(r'\(\s*([A-D])\s*\)', clean_line):
              ans = re.search(r'\(\s*([A-D])\s*\)', clean_line).group(1)
              current_q['ans'] = ans
@@ -104,10 +98,10 @@ def load_data_messy():
         # 3. Detect Options (Starts with A) or A.)
         elif current_q and (re.match(r'^[A-D]\)', clean_line) or re.match(r'^[A-D]\.', clean_line)):
              current_q['options'].append(clean_line)
-             
-        # 4. Continuation Text
+        
+        # 4. Continuation Text (append to previous option or question)
         elif current_q:
-            # If line is just "A)" or "B)" skip it, otherwise append text
+            # Skip if line is just "A)" or "B)"
             if len(clean_line) > 3:
                 if not current_q['options']:
                     current_q['q'] += " " + clean_line
@@ -116,7 +110,6 @@ def load_data_messy():
 
     if current_q: questions[current_topic].append(current_q)
     
-    # Remove empty stuff
     return {k:v for k,v in questions.items() if len(v)>0}, "Loaded"
 
 # --- 3. THE APP INTERFACE ---
@@ -155,7 +148,7 @@ else:
     data, msg = load_data_messy()
     
     if not data:
-        st.error("⚠️ Could not read questions from PDF. (Format issue)")
+        st.error("⚠️ Could not read questions from PDF.")
         st.write("Debug info: " + msg)
     else:
         # Topic Select
@@ -167,10 +160,9 @@ else:
         curr_idx, score = get_progress(st.session_state.user, topic)
         
         # Progress Bar
-        bar = st.sidebar.progress(0)
         if len(questions) > 0:
             pct = int((curr_idx / len(questions)) * 100)
-            bar.progress(pct)
+            st.sidebar.progress(pct)
             st.sidebar.write(f"Progress: {pct}%")
         
         # Show Question
@@ -182,18 +174,20 @@ else:
             
             # Options
             opts = q_data['options']
-            if not opts: st.warning("No options found for this question (check PDF format).")
+            for opt in opts:
+                st.text(opt)
             
-            # Radio button needs unique key
+            if not opts: st.warning("No options text found (check PDF formatting).")
+            
+            # Radio button
             user_choice = st.radio("Choose:", ["A", "B", "C", "D"], horizontal=True, key=f"q_{topic}_{curr_idx}")
             
             if st.button("Submit Answer"):
                 correct_ans = q_data.get('ans')
                 
-                # Handle missing answer key in PDF
+                # Handle missing answer key
                 if not correct_ans:
-                    st.warning("⚠️ This question has no answer key in the PDF!")
-                    # Allow skip
+                    st.warning("⚠️ No answer key found for this question.")
                     save_progress(st.session_state.user, topic, curr_idx + 1, score)
                     st.rerun()
                 
@@ -204,7 +198,7 @@ else:
                 else:
                     st.error(f"❌ Wrong! The correct answer was ({correct_ans})")
                     save_progress(st.session_state.user, topic, curr_idx + 1, score)
-                    st.rerun() # Wait for user to click next or auto refresh
+                    st.rerun() 
         else:
             st.balloons()
             st.success(f"🎉 Section Complete! Score: {score}/{len(questions)}")
