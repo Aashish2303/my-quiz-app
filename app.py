@@ -5,10 +5,9 @@ import pdfplumber
 import re
 import os
 
-# --- PAGE SETUP ---
-st.set_page_config(page_title="Loco Quiz Portal", layout="wide")
+st.set_page_config(page_title="Loco Inspector Quiz", layout="wide")
 
-# --- DATABASE FUNCTIONS ---
+# --- DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect("quiz.db")
     c = conn.cursor()
@@ -17,21 +16,23 @@ def init_db():
     conn.commit()
     conn.close()
 
-def signup(user, pwd):
-    conn = sqlite3.connect("quiz.db")
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE username = ?', (user,))
-    if c.fetchone(): return False
-    c.execute('INSERT INTO users VALUES (?,?)', (user, hashlib.sha256(pwd.encode()).hexdigest()))
-    conn.commit()
-    conn.close()
-    return True
-
-def login(user, pwd):
+def login_user(user, pwd):
     conn = sqlite3.connect("quiz.db")
     c = conn.cursor()
     c.execute('SELECT * FROM users WHERE username = ? AND password = ?', (user, hashlib.sha256(pwd.encode()).hexdigest()))
     return c.fetchone() is not None
+
+def register_user(user, pwd):
+    conn = sqlite3.connect("quiz.db")
+    c = conn.cursor()
+    try:
+        c.execute('INSERT INTO users VALUES (?,?)', (user, hashlib.sha256(pwd.encode()).hexdigest()))
+        conn.commit()
+        return True
+    except:
+        return False
+    finally:
+        conn.close()
 
 def save_progress(user, topic, idx, score):
     conn = sqlite3.connect("quiz.db")
@@ -40,7 +41,7 @@ def save_progress(user, topic, idx, score):
     conn.commit()
     conn.close()
 
-def load_progress(user, topic):
+def get_progress(user, topic):
     conn = sqlite3.connect("quiz.db")
     c = conn.cursor()
     c.execute('SELECT q_index, score FROM progress WHERE username = ? AND topic = ?', (user, topic))
@@ -48,80 +49,102 @@ def load_progress(user, topic):
     conn.close()
     return data if data else (0, 0)
 
-# --- SMART PDF PARSER ---
+# --- PDF PARSER (DEBUG MODE) ---
 @st.cache_data
-def parse_pdf_smart():
-    # 1. FIND THE FILE (Case Insensitive)
+def load_data_debug():
+    # 1. Find PDF
     files = [f for f in os.listdir('.') if f.lower().endswith('.pdf')]
     if not files:
-        return None, "No PDF file found in GitHub repository!"
+        return None, "❌ No PDF found! Please upload 'Question PDF.PDF' to GitHub."
     
-    pdf_path = files[0] # Use the first PDF found
-    questions = {}
-    current_topic = "General Questions"
-    questions[current_topic] = []
+    pdf_path = files[0]
+    debug_text = ""
     
-    # 2. EXTRACT TEXT
+    # 2. Extract Text
+    full_text = ""
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
+            for i, page in enumerate(pdf.pages):
+                page_text = page.extract_text()
+                if page_text:
+                    full_text += page_text + "\n"
+                    if i == 0: debug_text = page_text[:1000] # Save 1st page for debug
     except Exception as e:
-        return None, f"Error reading PDF: {e}"
+        return None, f"❌ Error reading PDF: {e}"
 
-    # 3. FIND QUESTIONS
-    lines = text.split('\n')
+    if len(full_text) < 100:
+        return None, "❌ The PDF seems empty or unreadable (scanned image?)."
+
+    # 3. Simple Parsing
+    questions = {}
+    current_topic = "All Questions" # Default topic
+    questions[current_topic] = []
+    
+    lines = full_text.split('\n')
     current_q = None
+    
+    # REGEX HELPERS
+    # Matches "1." or "105." or "1 ." at start of line
+    q_pattern = re.compile(r'^\s*(\d+)\s*\.') 
+    # Matches "1. General Rules" (Topic detection)
+    topic_pattern = re.compile(r'^\s*\d+\.\s+[A-Z].*(Rules|Manual|Section|CHAPTER)')
     
     for line in lines:
         line = line.strip()
         if not line: continue
         
-        # Topic Detection (Lines starting with number and letters, usually headers)
-        # We make this stricter to avoid confusing it with questions
-        if re.match(r'^\d+\.\s+[A-Z][a-z]+', line) and "Answer" not in line and len(line) < 100:
-            # It's likely a topic header
+        # Check for Topic (Optional - can be disabled if causing issues)
+        if topic_pattern.match(line) and len(line) < 100:
             current_topic = line
             if current_topic not in questions: questions[current_topic] = []
+            current_q = None # Reset
             continue
 
-        # Question Detection (Starts with "1." or "105.")
-        # We strip quotes just in case
-        clean_line = line.replace('"', '')
-        if re.match(r'^\d+\.', clean_line):
+        # Check for Question Start
+        match = q_pattern.match(line)
+        if match:
+            # If we were building a question, save it
             if current_q: questions[current_topic].append(current_q)
-            current_q = {"q": clean_line, "options": [], "ans": None}
-            continue
-        
-        # Answer Key Detection (Matches "(B)" or "( B )")
-        ans_match = re.search(r'\(\s*([A-D])\s*\)', line)
-        if current_q and ans_match:
-            current_q['ans'] = ans_match.group(1)
-            # Remove the answer part from line to see if there is option text left
-            line = re.sub(r'\(\s*[A-D]\s*\)', '', line).strip()
             
-        # Option Detection (A) ... B) ...)
-        if current_q:
+            # Start new question
+            current_q = {
+                "q": line, 
+                "options": [], 
+                "ans": None
+            }
+        
+        # If we are inside a question
+        elif current_q:
+            # Check for Answer Key: (A) or (B)
+            ans_match = re.search(r'\(\s*([A-D])\s*\)', line)
+            if ans_match:
+                current_q["ans"] = ans_match.group(1)
+                # Remove answer key from text
+                line = re.sub(r'\(\s*[A-D]\s*\)', '', line).strip()
+            
+            # Check for Options: A) ... B) ...
             if re.match(r'^[A-D]\)', line) or re.match(r'^\(?[A-D]\)', line):
-                current_q['options'].append(line)
-            elif any(m in line for m in ["A)", "B)", "C)", "D)"]):
-                 current_q['options'].append(line)
-            elif line:
-                # Just text belonging to previous line
-                if not current_q['options']:
-                    current_q['q'] += " " + line
-                else:
-                    current_q['options'][-1] += " " + line
+                 current_q["options"].append(line)
+            elif any(x in line for x in [" A)", " B)", " C)", " D)"]):
+                 # Attempt to split lines that have multiple options like "A) ... B) ..."
+                 current_q["options"].append(line)
+            else:
+                 # Just text continuation
+                 if not current_q["options"]:
+                     current_q["q"] += " " + line
+                 else:
+                     current_q["options"][-1] += " " + line
 
     # Save last question
     if current_q: questions[current_topic].append(current_q)
     
-    # Remove empty topics
-    final_data = {k: v for k,v in questions.items() if v}
+    # Filter empty topics
+    final_data = {k:v for k,v in questions.items() if v}
     
     if not final_data:
-        return None, f"Found file '{pdf_path}' but could not find any questions inside it! (Check PDF format)"
+        return None, f"❌ Parsed {len(lines)} lines but found 0 questions. \n\n**Debug View (First 500 chars):**\n{debug_text}..."
         
-    return final_data, f"Success! Loaded {sum(len(v) for v in final_data.values())} questions from {pdf_path}"
+    return final_data, f"✅ Success! Found {sum(len(v) for v in final_data.values())} questions."
 
 # --- MAIN APP ---
 init_db()
@@ -129,83 +152,66 @@ init_db()
 if 'user' not in st.session_state: st.session_state.user = None
 
 if not st.session_state.user:
-    st.title("🚆 Quiz Portal Login")
+    st.title("🚂 Loco Inspector Quiz")
     tab1, tab2 = st.tabs(["Login", "Register"])
-    
     with tab1:
         u = st.text_input("Username")
         p = st.text_input("Password", type="password")
-        if st.button("Log In"):
-            if login(u, p):
+        if st.button("Login"):
+            if login_user(u, p):
                 st.session_state.user = u
                 st.rerun()
-            else: st.error("Invalid Username or Password")
-            
+            else: st.error("Invalid credentials")
     with tab2:
-        nu = st.text_input("New Username")
-        np = st.text_input("New Password", type="password")
-        if st.button("Sign Up"):
-            if signup(nu, np): st.success("Account created! Go to Login.")
-            else: st.error("Username already taken.")
-
+        nu = st.text_input("New User")
+        np = st.text_input("New Pass", type="password")
+        if st.button("Register"):
+            if register_user(nu, np): st.success("Created! Login now.")
+            else: st.error("User exists")
 else:
-    # --- LOGGED IN DASHBOARD ---
-    st.sidebar.markdown(f"👤 **{st.session_state.user}**")
+    # LOGGED IN
+    st.sidebar.markdown(f"User: **{st.session_state.user}**")
     if st.sidebar.button("Logout"):
         st.session_state.user = None
         st.rerun()
-    
-    st.title("📝 Quiz Dashboard")
-    
-    # LOAD DATA
-    data, message = parse_pdf_smart()
-    
-    if not data:
-        st.error(message) # Show exact error if something is wrong
-    else:
-        # st.success(message) # Uncomment this to see debug success message
         
-        # TOPIC SELECTOR
-        topic_list = list(data.keys())
-        topic = st.sidebar.selectbox("Select Topic", topic_list)
-        
-        # QUIZ LOGIC
+    data, msg = load_data_debug()
+    
+    # --- DEBUG SECTION ---
+    with st.expander("Show System Status"):
+        st.write(msg)
+    
+    if data:
+        topic = st.sidebar.selectbox("Select Topic", list(data.keys()))
         q_list = data[topic]
-        current_idx, score = load_progress(st.session_state.user, topic)
+        idx, score = get_progress(st.session_state.user, topic)
         
-        # PROGRESS BAR
-        total = len(q_list)
-        progress = int((current_idx / total) * 100) if total > 0 else 0
-        st.sidebar.write(f"**Progress:** {progress}%")
-        st.sidebar.progress(progress)
+        # Progress Bar
+        pct = int((idx / len(q_list)) * 100)
+        st.sidebar.progress(pct)
+        st.sidebar.write(f"{pct}% Complete")
         
-        if current_idx < total:
-            q = q_list[current_idx]
-            
-            st.markdown(f"### Question {current_idx + 1} / {total}")
+        if idx < len(q_list):
+            q = q_list[idx]
+            st.markdown(f"### Question {idx+1}")
             st.info(q['q'])
+            st.write("Options:")
+            for o in q['options']: st.text(o)
             
-            st.write("**Options:**")
-            # Display options clearly
-            for opt in q['options']:
-                st.text(opt)
-                
-            # Selection
-            sel = st.radio("Your Answer:", ["A", "B", "C", "D"], horizontal=True, key=f"ans_{topic}_{current_idx}")
-            
-            if st.button("Submit Answer"):
-                correct = q.get('ans', '').strip()
-                if sel == correct:
-                    st.success("✅ Correct!")
-                    save_progress(st.session_state.user, topic, current_idx + 1, score + 1)
+            sel = st.radio("Answer:", ["A","B","C","D"], horizontal=True, key=f"{topic}_{idx}")
+            if st.button("Submit"):
+                corr = q.get('ans', '').strip()
+                if sel == corr:
+                    st.success("Correct! ✅")
+                    save_progress(st.session_state.user, topic, idx+1, score+1)
                 else:
-                    st.error(f"❌ Wrong! The answer was {correct}")
-                    save_progress(st.session_state.user, topic, current_idx + 1, score)
+                    st.error(f"Wrong! Answer: {corr}")
+                    save_progress(st.session_state.user, topic, idx+1, score)
                 st.rerun()
-                
         else:
-            st.balloons()
-            st.success(f"🎉 Topic Completed! Score: {score}/{total}")
-            if st.button("Restart Topic"):
+            st.success(f"Topic Finished! Score: {score}/{len(q_list)}")
+            if st.button("Reset"):
                 save_progress(st.session_state.user, topic, 0, 0)
                 st.rerun()
+    else:
+        st.error("Could not load questions. Check the Debug section above.")
